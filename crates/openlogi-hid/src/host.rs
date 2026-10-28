@@ -23,6 +23,7 @@ use openlogi_device::ChannelPool;
 use openlogi_device::LightWatch;
 use openlogi_device::backend::{HidBackend, HotplugStream};
 use openlogi_device::backlight::{BacklightChange, BacklightState};
+use openlogi_device::g600::{ReadError as G600ReadError, Snapshot as G600Snapshot};
 use openlogi_device::inventory::{Enumerator, InventoryError};
 use openlogi_device::pairing::PairingReceiver;
 use openlogi_device::write::{
@@ -237,6 +238,12 @@ pub async fn watch_litra(
     model: LitraModel,
 ) -> Result<Option<LightWatch>, WriteError> {
     device::watch_litra(&*native_backend(), route, model).await
+}
+
+/// Read the active-profile report and onboard profiles of the G600 `route`
+/// reaches. Read-only: nothing is written to the mouse.
+pub async fn read_g600_snapshot(route: &DeviceRoute) -> Result<G600Snapshot, G600ReadError> {
+    openlogi_device::g600::read_snapshot(&*native_backend(), route).await
 }
 
 /// Walk the HID++ feature table of the device `route` reaches.

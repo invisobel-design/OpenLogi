@@ -15,6 +15,7 @@ pub mod battery;
 pub mod controls;
 pub mod dpi;
 pub mod features;
+pub mod g600;
 pub mod lighting;
 pub mod pointer_speed;
 pub mod smartshift;
@@ -26,6 +27,8 @@ pub enum DiagCmd {
     Features(features::FeaturesArgs),
     /// Dump HID++ 0x1b04 reprogrammable controls and capability flags.
     Controls(controls::ControlsArgs),
+    /// Read a G600's onboard profiles (read-only; nothing is written).
+    G600(g600::G600Args),
     /// Read the raw battery report (0x1004, 0x1000, or 0x1F20 fields).
     Battery(battery::BatteryArgs),
     /// Read DPI → write a small delta → read back → restore → report.
@@ -48,6 +51,7 @@ impl DiagCmd {
         match self {
             Self::Features(args) => features::run(args).await,
             Self::Controls(args) => controls::run(args).await,
+            Self::G600(args) => g600::run(args).await,
             Self::Battery(args) => battery::run(args).await,
             Self::Dpi(args) => dpi::run(args).await,
             Self::Smartshift(args) => smartshift::run(args).await,
