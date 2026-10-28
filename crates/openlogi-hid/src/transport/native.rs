@@ -7,13 +7,15 @@
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 
-use async_hid::{AsyncHidWrite as _, Device, DeviceWriter};
+use async_hid::{
+    AsyncHidFeatureHandle as _, AsyncHidWrite as _, Device, DeviceFeatureHandle, DeviceWriter,
+};
 use hidpp::async_trait;
 use hidpp::channel::HidppChannel;
 
 use openlogi_device::DeviceIoGate;
 use openlogi_device::backend::{
-    BackendError, HidBackend, HotplugStream, NodeId, NodeInfo, RawWriter,
+    BackendError, FeatureReader, HidBackend, HotplugStream, NodeId, NodeInfo, RawWriter,
 };
 
 use crate::recording::{
@@ -231,8 +233,66 @@ impl HidBackend for NativeBackend {
         }
     }
 
+    async fn open_feature_reader(
+        &self,
+        node: &NodeInfo,
+    ) -> Result<Box<dyn FeatureReader>, BackendError> {
+        // A cassette has no record type for feature reports, so reading them
+        // under a recording would leave traffic out of the capture without
+        // saying so. Refuse instead of recording a lie.
+        if self.recording.is_some() {
+            return Err(BackendError::Backend(
+                "feature reports cannot be captured in a recording".to_owned(),
+            ));
+        }
+        self.device_io.ensure_allowed()?;
+        let handle = self
+            .handle(node)?
+            .open_feature_handle()
+            .await
+            .map_err(super::backend_error)?;
+        self.device_io.ensure_allowed()?;
+        Ok(Box::new(NativeFeatureReader {
+            handle,
+            device_io: self.device_io.clone(),
+        }))
+    }
+
     fn watch(&self) -> Result<HotplugStream, BackendError> {
         Ok(Box::new(watch_nodes()?))
+    }
+}
+
+/// [`FeatureReader`] over an `async-hid` feature-report handle.
+struct NativeFeatureReader {
+    handle: DeviceFeatureHandle,
+    device_io: DeviceIoGate,
+}
+
+#[async_trait]
+impl FeatureReader for NativeFeatureReader {
+    async fn read_feature_report(
+        &mut self,
+        report_id: u8,
+        max_len: usize,
+    ) -> Result<Vec<u8>, BackendError> {
+        self.device_io.ensure_allowed()?;
+        // The report ID rides in the first byte of the buffer, so a zero-length
+        // buffer cannot ask for anything.
+        if max_len == 0 {
+            return Err(BackendError::Backend(
+                "a feature report buffer needs room for the report ID".to_owned(),
+            ));
+        }
+        let mut report = vec![0; max_len];
+        report[0] = report_id;
+        let filled = self
+            .handle
+            .read_feature_report(&mut report)
+            .await
+            .map_err(super::backend_error)?;
+        report.truncate(filled);
+        Ok(report)
     }
 }
 

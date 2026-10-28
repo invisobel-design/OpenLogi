@@ -148,6 +148,36 @@ pub trait RawWriter: Send + Sync {
     async fn write_output_report(&mut self, report: &[u8]) -> Result<(), BackendError>;
 }
 
+/// A feature-report reader, for vendor protocols the HID++ framing cannot model.
+///
+/// Logitech's pre-HID++ 2.0 gaming mice (the G600) keep their configuration in
+/// vendor feature reports rather than behind HID++ requests. This is the read
+/// half of that access; nothing here writes to the device.
+// Not `expect`: the lint is raised inside `async_trait`'s expansion, which rustc
+// does not credit to an expectation. Clippy 1.99 flags the `#[must_use]` the
+// macro puts on each boxed future; rust-clippy#17547 (1.100) stops linting
+// macro-generated code.
+#[expect(clippy::allow_attributes, reason = "see above")]
+#[allow(
+    clippy::double_must_use,
+    reason = "raised on `async_trait`'s generated methods, not on this source"
+)]
+#[async_trait]
+pub trait FeatureReader: Send + Sync {
+    /// Read feature report `report_id`, returned with the report ID as its
+    /// first byte.
+    ///
+    /// `max_len` sizes the buffer offered to the OS, report ID included. It
+    /// must cover the largest feature report the node defines: some hosts
+    /// reject a smaller buffer outright. The returned bytes are only what the
+    /// device filled, so a shorter report comes back shorter.
+    async fn read_feature_report(
+        &mut self,
+        report_id: u8,
+        max_len: usize,
+    ) -> Result<Vec<u8>, BackendError>;
+}
+
 /// The HID stack beneath OpenLogi's HID++ layer.
 ///
 /// One implementation per host HID API. Everything above it — enumeration
@@ -190,6 +220,20 @@ pub trait HidBackend: Send + Sync {
 
     /// Open `node` for raw output reports.
     async fn open_raw_writer(&self, node: &NodeInfo) -> Result<Box<dyn RawWriter>, BackendError>;
+
+    /// Open `node` for feature-report reads.
+    ///
+    /// Optional: a backend that cannot read feature reports keeps this
+    /// default, which says so. A scripted or replay backend has no such reports
+    /// to serve until a fixture format exists for them.
+    async fn open_feature_reader(
+        &self,
+        _node: &NodeInfo,
+    ) -> Result<Box<dyn FeatureReader>, BackendError> {
+        Err(BackendError::Backend(
+            "this HID backend cannot read feature reports".to_owned(),
+        ))
+    }
 
     /// Subscribe to node connect/disconnect events.
     fn watch(&self) -> Result<HotplugStream, BackendError>;
