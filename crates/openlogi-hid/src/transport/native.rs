@@ -15,7 +15,8 @@ use hidpp::channel::HidppChannel;
 
 use openlogi_device::DeviceIoGate;
 use openlogi_device::backend::{
-    BackendError, FeatureReader, HidBackend, HotplugStream, NodeId, NodeInfo, RawWriter,
+    BackendError, FeatureReader, FeatureWriter, HidBackend, HotplugStream, NodeId, NodeInfo,
+    RawWriter,
 };
 
 use crate::recording::{
@@ -141,6 +142,32 @@ impl NativeBackend {
             .ok_or(BackendError::Disconnected)
     }
 
+    /// Open `node`'s feature-report handle.
+    async fn open_feature_access(
+        &self,
+        node: &NodeInfo,
+    ) -> Result<NativeFeatureAccess, BackendError> {
+        // A cassette has no record type for feature reports, so touching them
+        // under a recording would leave traffic out of the capture without
+        // saying so. Refuse instead of recording a lie.
+        if self.recording.is_some() {
+            return Err(BackendError::Backend(
+                "feature reports cannot be captured in a recording".to_owned(),
+            ));
+        }
+        self.device_io.ensure_allowed()?;
+        let handle = self
+            .handle(node)?
+            .open_feature_handle()
+            .await
+            .map_err(super::backend_error)?;
+        self.device_io.ensure_allowed()?;
+        Ok(NativeFeatureAccess {
+            handle,
+            device_io: self.device_io.clone(),
+        })
+    }
+
     async fn open_native_raw_writer(
         &self,
         node: &NodeInfo,
@@ -237,25 +264,14 @@ impl HidBackend for NativeBackend {
         &self,
         node: &NodeInfo,
     ) -> Result<Box<dyn FeatureReader>, BackendError> {
-        // A cassette has no record type for feature reports, so reading them
-        // under a recording would leave traffic out of the capture without
-        // saying so. Refuse instead of recording a lie.
-        if self.recording.is_some() {
-            return Err(BackendError::Backend(
-                "feature reports cannot be captured in a recording".to_owned(),
-            ));
-        }
-        self.device_io.ensure_allowed()?;
-        let handle = self
-            .handle(node)?
-            .open_feature_handle()
-            .await
-            .map_err(super::backend_error)?;
-        self.device_io.ensure_allowed()?;
-        Ok(Box::new(NativeFeatureReader {
-            handle,
-            device_io: self.device_io.clone(),
-        }))
+        Ok(Box::new(self.open_feature_access(node).await?))
+    }
+
+    async fn open_feature_writer(
+        &self,
+        node: &NodeInfo,
+    ) -> Result<Box<dyn FeatureWriter>, BackendError> {
+        Ok(Box::new(self.open_feature_access(node).await?))
     }
 
     fn watch(&self) -> Result<HotplugStream, BackendError> {
@@ -263,14 +279,31 @@ impl HidBackend for NativeBackend {
     }
 }
 
-/// [`FeatureReader`] over an `async-hid` feature-report handle.
-struct NativeFeatureReader {
+/// [`FeatureReader`] and [`FeatureWriter`] over an `async-hid` feature-report
+/// handle.
+struct NativeFeatureAccess {
     handle: DeviceFeatureHandle,
     device_io: DeviceIoGate,
 }
 
 #[async_trait]
-impl FeatureReader for NativeFeatureReader {
+impl FeatureWriter for NativeFeatureAccess {
+    async fn write_feature_report(&mut self, report: &[u8]) -> Result<(), BackendError> {
+        self.device_io.ensure_allowed()?;
+        if report.is_empty() {
+            return Err(BackendError::Backend(
+                "a feature report needs its report ID".to_owned(),
+            ));
+        }
+        self.handle
+            .write_feature_report(report)
+            .await
+            .map_err(super::backend_error)
+    }
+}
+
+#[async_trait]
+impl FeatureReader for NativeFeatureAccess {
     async fn read_feature_report(
         &mut self,
         report_id: u8,

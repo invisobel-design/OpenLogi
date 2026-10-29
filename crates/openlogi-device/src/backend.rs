@@ -178,6 +178,26 @@ pub trait FeatureReader: Send + Sync {
     ) -> Result<Vec<u8>, BackendError>;
 }
 
+/// A feature-report writer, the write half of [`FeatureReader`].
+///
+/// Sends one whole feature report. It is only ever used by code that reads the
+/// report back afterwards, since a successful host call does not prove the
+/// device accepted the contents.
+// Not `expect`: the lint is raised inside `async_trait`'s expansion, which rustc
+// does not credit to an expectation. Clippy 1.99 flags the `#[must_use]` the
+// macro puts on each boxed future; rust-clippy#17547 (1.100) stops linting
+// macro-generated code.
+#[expect(clippy::allow_attributes, reason = "see above")]
+#[allow(
+    clippy::double_must_use,
+    reason = "raised on `async_trait`'s generated methods, not on this source"
+)]
+#[async_trait]
+pub trait FeatureWriter: Send + Sync {
+    /// Write one feature report, report ID included as the first byte.
+    async fn write_feature_report(&mut self, report: &[u8]) -> Result<(), BackendError>;
+}
+
 /// The HID stack beneath OpenLogi's HID++ layer.
 ///
 /// One implementation per host HID API. Everything above it — enumeration
@@ -232,6 +252,19 @@ pub trait HidBackend: Send + Sync {
     ) -> Result<Box<dyn FeatureReader>, BackendError> {
         Err(BackendError::Backend(
             "this HID backend cannot read feature reports".to_owned(),
+        ))
+    }
+
+    /// Open `node` for feature-report writes.
+    ///
+    /// Optional, like [`Self::open_feature_reader`]: the default says the
+    /// backend cannot.
+    async fn open_feature_writer(
+        &self,
+        _node: &NodeInfo,
+    ) -> Result<Box<dyn FeatureWriter>, BackendError> {
+        Err(BackendError::Backend(
+            "this HID backend cannot write feature reports".to_owned(),
         ))
     }
 

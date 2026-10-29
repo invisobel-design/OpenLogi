@@ -19,6 +19,10 @@
 use openlogi_device_registry::g600::matches_g600;
 use thiserror::Error;
 
+mod spec;
+
+pub use spec::ParseAssignmentError;
+
 use crate::backend::{BackendError, FeatureReader, HidBackend};
 use crate::channel::route::{DeviceRoute, find_raw_route_node};
 use crate::write::WriteError;
@@ -175,6 +179,22 @@ pub enum MouseButton {
 }
 
 impl MouseButton {
+    /// The button's number, `1` through `5`.
+    #[must_use]
+    pub const fn number(self) -> u8 {
+        self.code()
+    }
+
+    const fn code(self) -> u8 {
+        match self {
+            Self::Button1 => 0x01,
+            Self::Button2 => 0x02,
+            Self::Button3 => 0x03,
+            Self::Button4 => 0x04,
+            Self::Button5 => 0x05,
+        }
+    }
+
     const fn from_code(code: u8) -> Option<Self> {
         match code {
             0x01 => Some(Self::Button1),
@@ -208,6 +228,17 @@ pub enum Function {
 }
 
 impl Function {
+    const fn code(self) -> u8 {
+        match self {
+            Self::DpiUp => 0x11,
+            Self::DpiDown => 0x12,
+            Self::DpiCycle => 0x13,
+            Self::ProfileCycle => 0x14,
+            Self::DpiShift => 0x15,
+            Self::GShift => 0x17,
+        }
+    }
+
     const fn from_code(code: u8) -> Option<Self> {
         match code {
             0x11 => Some(Self::DpiUp),
@@ -253,6 +284,22 @@ pub enum ButtonAssignment {
 }
 
 impl ButtonAssignment {
+    /// The three bytes this assignment is stored as: the inverse of decoding.
+    #[must_use]
+    pub const fn encode(self) -> [u8; BUTTON_ENTRY_LEN] {
+        match self {
+            Self::Unassigned => [0, 0, 0],
+            Self::Keyboard { modifiers, usage } => [0x00, modifiers.bits(), usage],
+            Self::Mouse(button) => [button.code(), 0, 0],
+            Self::Function(function) => [function.code(), 0, 0],
+            Self::Unrecognized {
+                code,
+                modifiers,
+                usage,
+            } => [code, modifiers, usage],
+        }
+    }
+
     fn decode([code, modifiers, usage]: [u8; BUTTON_ENTRY_LEN]) -> Self {
         match (code, modifiers, usage) {
             (0x00, 0x00, 0x00) => Self::Unassigned,
@@ -377,17 +424,37 @@ impl Profile {
     /// What `button` does in `layer`.
     #[must_use]
     pub fn button(&self, layer: Layer, button: GButton) -> ButtonAssignment {
-        let table = match layer {
-            Layer::Normal => BUTTONS,
-            Layer::Shifted => SHIFT_BUTTONS,
-        };
-        let start = table + BUTTON_ENTRY_LEN * button.index();
+        let start = button_offset(layer, button);
         ButtonAssignment::decode([self.raw[start], self.raw[start + 1], self.raw[start + 2]])
+    }
+
+    /// This profile with `button` in `layer` set to `assignment`.
+    ///
+    /// Every other byte is carried over unchanged, including the regions this
+    /// module does not decode.
+    #[must_use]
+    pub fn with_button(&self, layer: Layer, button: GButton, assignment: ButtonAssignment) -> Self {
+        let start = button_offset(layer, button);
+        let mut raw = self.raw;
+        raw[start..start + BUTTON_ENTRY_LEN].copy_from_slice(&assignment.encode());
+        Self {
+            slot: self.slot,
+            raw,
+        }
     }
 
     fn rgb(&self, start: usize) -> [u8; 3] {
         [self.raw[start], self.raw[start + 1], self.raw[start + 2]]
     }
+}
+
+/// Offset of `button`'s entry in `layer`'s table within a profile report.
+fn button_offset(layer: Layer, button: GButton) -> usize {
+    let table = match layer {
+        Layer::Normal => BUTTONS,
+        Layer::Shifted => SHIFT_BUTTONS,
+    };
+    table + BUTTON_ENTRY_LEN * button.index()
 }
 
 /// Why a profile could not be read from the mouse.
@@ -508,6 +575,146 @@ pub async fn read_snapshot(
     Ok(Snapshot {
         active_profile_report,
         profiles,
+    })
+}
+
+/// Whether an edit may take away the mouse's primary clicks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrimaryButtons {
+    /// Refuse to change G1 and G2 of the normal layer — the left and right
+    /// click — to anything but what they are.
+    Protect,
+    /// Allow it. A mouse whose clicks are gone can still be repaired from the
+    /// keyboard, but only by someone who knows to.
+    Allow,
+}
+
+/// One button edit: which entry to change, and to what.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ButtonEdit {
+    /// The profile to change.
+    pub slot: ProfileSlot,
+    /// The button table to change.
+    pub layer: Layer,
+    /// The button to change.
+    pub button: GButton,
+    /// What the button should do afterwards.
+    pub assignment: ButtonAssignment,
+}
+
+/// What an edit did, so a caller can report it or undo it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EditOutcome {
+    /// The profile as it was before the edit.
+    pub before: Profile,
+    /// The profile as read back from the mouse after the edit.
+    pub after: Profile,
+    /// Whether anything was written. `false` when the button already held the
+    /// requested assignment.
+    pub written: bool,
+}
+
+/// Why a button edit did not happen, or could not be confirmed.
+#[derive(Debug, Error)]
+pub enum EditError {
+    /// Reading the profile, before or after the write, failed.
+    #[error(transparent)]
+    Read(#[from] ReadError),
+    /// Writing the report failed.
+    #[error("writing the profile failed: {0}")]
+    Write(BackendError),
+    /// The edit would change the left or right click and the caller did not
+    /// allow that.
+    #[error(
+        "G{} in the normal layer is a primary click; changing it needs PrimaryButtons::Allow",
+        button.number()
+    )]
+    PrimaryButton {
+        /// The protected button.
+        button: GButton,
+    },
+    /// The profile read back after the write differs from what was written.
+    ///
+    /// The mouse may now hold something other than either profile; `before` is
+    /// what to restore.
+    #[error("the mouse did not keep the profile that was written")]
+    NotKept {
+        /// The profile as it was before the write.
+        before: Box<Profile>,
+        /// The profile read back.
+        read_back: Box<Profile>,
+    },
+}
+
+/// Whether `edit` would change what a primary click (G1 or G2, normal layer) does.
+fn touches_primary(edit: ButtonEdit, current: &Profile) -> bool {
+    edit.layer == Layer::Normal
+        && matches!(edit.button.number(), 1 | 2)
+        && current.button(edit.layer, edit.button) != edit.assignment
+}
+
+/// Set one button of one onboard profile, then confirm by reading it back.
+///
+/// Reads the profile, changes only the requested entry, writes the whole
+/// report, reads it again and compares. Nothing is written when the button
+/// already holds the assignment.
+///
+/// # Errors
+///
+/// [`EditError::PrimaryButton`] before anything is written when `guard`
+/// protects a primary click that the edit would change; the read and write
+/// errors of the backend; and [`EditError::NotKept`] when the read-back
+/// differs from what was written.
+pub async fn edit_button(
+    backend: &dyn HidBackend,
+    route: &DeviceRoute,
+    edit: ButtonEdit,
+    guard: PrimaryButtons,
+) -> Result<EditOutcome, EditError> {
+    if !is_g600_route(route) {
+        return Err(ReadError::NotAG600.into());
+    }
+    let node = find_raw_route_node(backend, route)
+        .await
+        .map_err(ReadError::from)?
+        .ok_or(ReadError::DeviceNotFound)?;
+    let mut reader = backend
+        .open_feature_reader(&node)
+        .await
+        .map_err(ReadError::from)?;
+    let before = read_profile(reader.as_mut(), edit.slot).await?;
+    if guard == PrimaryButtons::Protect && touches_primary(edit, &before) {
+        return Err(EditError::PrimaryButton {
+            button: edit.button,
+        });
+    }
+    let wanted = before.with_button(edit.layer, edit.button, edit.assignment);
+    if wanted == before {
+        return Ok(EditOutcome {
+            after: before.clone(),
+            before,
+            written: false,
+        });
+    }
+    let mut writer = backend
+        .open_feature_writer(&node)
+        .await
+        .map_err(EditError::Write)?;
+    writer
+        .write_feature_report(wanted.as_bytes())
+        .await
+        .map_err(EditError::Write)?;
+    let after = read_profile(reader.as_mut(), edit.slot).await?;
+    if after != wanted {
+        return Err(EditError::NotKept {
+            before: Box::new(before),
+            read_back: Box::new(after),
+        });
+    }
+    Ok(EditOutcome {
+        before,
+        after,
+        written: true,
     })
 }
 
@@ -879,21 +1086,109 @@ mod tests {
         raw_route(0xc24a, 0xff80, 0x0080, "id:g600-node")
     }
 
-    /// A backend whose only feature-report node is `nodes`.
+    type Store = std::sync::Arc<std::sync::Mutex<std::collections::HashMap<u8, Vec<u8>>>>;
+
+    /// What a fake mouse does with a written report.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Writes {
+        /// Keep it, so a read returns what was written.
+        Keep,
+        /// Accept it and forget it.
+        Ignore,
+        /// Fail the write.
+        Fail,
+    }
+
+    /// A backend whose only feature-report node is `nodes`, with a mouse behind
+    /// it that remembers its reports and logs every report written.
     struct FakeBackend {
         nodes: Vec<NodeInfo>,
-        reports: std::collections::HashMap<u8, Vec<u8>>,
+        reports: Store,
+        writes: Writes,
+        written: std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
     }
 
     impl FakeBackend {
-        fn with_g600() -> Self {
+        fn new(nodes: Vec<NodeInfo>, reports: &[&str]) -> Self {
             Self {
-                nodes: vec![g600_node()],
-                reports: [ACTIVE, FIRST, SECOND, THIRD]
-                    .map(bytes)
-                    .into_iter()
-                    .map(|report| (report[0], report))
-                    .collect(),
+                nodes,
+                reports: std::sync::Arc::new(std::sync::Mutex::new(
+                    reports
+                        .iter()
+                        .map(|report| bytes(report))
+                        .map(|report| (report[0], report))
+                        .collect(),
+                )),
+                writes: Writes::Keep,
+                written: std::sync::Arc::default(),
+            }
+        }
+
+        fn with_g600() -> Self {
+            Self::new(vec![g600_node()], &[ACTIVE, FIRST, SECOND, THIRD])
+        }
+
+        fn with_writes(mut self, writes: Writes) -> Self {
+            self.writes = writes;
+            self
+        }
+
+        fn stored(&self, report_id: u8) -> Vec<u8> {
+            self.reports.lock().expect("store")[&report_id].clone()
+        }
+
+        fn writes_seen(&self) -> Vec<Vec<u8>> {
+            self.written.lock().expect("log").clone()
+        }
+    }
+
+    /// The fake mouse's feature-report port.
+    struct FakePort {
+        reports: Store,
+        writes: Writes,
+        written: std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+    }
+
+    #[hidpp::async_trait]
+    impl FeatureReader for FakePort {
+        async fn read_feature_report(
+            &mut self,
+            report_id: u8,
+            _max_len: usize,
+        ) -> Result<Vec<u8>, BackendError> {
+            self.reports
+                .lock()
+                .expect("store")
+                .get(&report_id)
+                .cloned()
+                .ok_or(BackendError::Disconnected)
+        }
+    }
+
+    #[hidpp::async_trait]
+    impl crate::backend::FeatureWriter for FakePort {
+        async fn write_feature_report(&mut self, report: &[u8]) -> Result<(), BackendError> {
+            self.written.lock().expect("log").push(report.to_vec());
+            match self.writes {
+                Writes::Keep => {
+                    self.reports
+                        .lock()
+                        .expect("store")
+                        .insert(report[0], report.to_vec());
+                    Ok(())
+                }
+                Writes::Ignore => Ok(()),
+                Writes::Fail => Err(BackendError::Backend("write refused".to_owned())),
+            }
+        }
+    }
+
+    impl FakeBackend {
+        fn port(&self) -> FakePort {
+            FakePort {
+                reports: self.reports.clone(),
+                writes: self.writes,
+                written: self.written.clone(),
             }
         }
     }
@@ -926,10 +1221,14 @@ mod tests {
             &self,
             _node: &NodeInfo,
         ) -> Result<Box<dyn FeatureReader>, BackendError> {
-            Ok(Box::new(FakeReader {
-                reports: self.reports.clone(),
-                ..FakeReader::default()
-            }))
+            Ok(Box::new(self.port()))
+        }
+
+        async fn open_feature_writer(
+            &self,
+            _node: &NodeInfo,
+        ) -> Result<Box<dyn crate::backend::FeatureWriter>, BackendError> {
+            Ok(Box::new(self.port()))
         }
 
         fn watch(&self) -> Result<crate::backend::HotplugStream, BackendError> {
@@ -969,10 +1268,7 @@ mod tests {
 
     #[test]
     fn snapshot_reports_a_missing_device() {
-        let backend = FakeBackend {
-            nodes: Vec::new(),
-            reports: std::collections::HashMap::new(),
-        };
+        let backend = FakeBackend::new(Vec::new(), &[]);
         let error = futures_lite::future::block_on(read_snapshot(&backend, &g600_route()))
             .expect_err("nothing is connected");
         assert!(matches!(error, ReadError::DeviceNotFound));
@@ -980,16 +1276,248 @@ mod tests {
 
     #[test]
     fn snapshot_will_not_choose_between_identical_nodes() {
-        let backend = FakeBackend {
-            nodes: vec![g600_node(), g600_node()],
-            reports: std::collections::HashMap::new(),
-        };
+        let backend = FakeBackend::new(vec![g600_node(), g600_node()], &[]);
         let error = futures_lite::future::block_on(read_snapshot(&backend, &g600_route()))
             .expect_err("two nodes answer to one route");
         assert!(matches!(
             error,
             ReadError::Route(WriteError::AmbiguousRawDevice)
         ));
+    }
+
+    fn edit(slot: ProfileSlot, layer: Layer, number: u8, text: &str) -> ButtonEdit {
+        ButtonEdit {
+            slot,
+            layer,
+            button: g(number),
+            assignment: text.parse().expect("valid assignment text"),
+        }
+    }
+
+    fn run_edit(
+        backend: &FakeBackend,
+        edit: ButtonEdit,
+        guard: PrimaryButtons,
+    ) -> Result<EditOutcome, EditError> {
+        futures_lite::future::block_on(edit_button(backend, &g600_route(), edit, guard))
+    }
+
+    /// Positions at which two reports differ.
+    fn differing(a: &[u8], b: &[u8]) -> Vec<usize> {
+        (0..a.len().max(b.len()))
+            .filter(|&i| a.get(i) != b.get(i))
+            .collect()
+    }
+
+    #[test]
+    fn an_edit_changes_exactly_one_entry_and_nothing_else() {
+        for (slot, layer, number, text, offset) in [
+            (
+                ProfileSlot::First,
+                Layer::Normal,
+                9,
+                "key:ctrl+b",
+                31 + 8 * 3,
+            ),
+            (
+                ProfileSlot::First,
+                Layer::Shifted,
+                12,
+                "mouse:3",
+                94 + 11 * 3,
+            ),
+            // Profile 3 holds a code this module cannot name; an edit elsewhere
+            // must leave it alone.
+            (
+                ProfileSlot::Third,
+                Layer::Normal,
+                6,
+                "fn:dpi-up",
+                31 + 5 * 3,
+            ),
+        ] {
+            let backend = FakeBackend::with_g600();
+            let before = backend.stored(slot.report_id());
+            let outcome = run_edit(
+                &backend,
+                edit(slot, layer, number, text),
+                PrimaryButtons::Protect,
+            )
+            .expect("the edit is kept");
+            let after = backend.stored(slot.report_id());
+            assert!(outcome.written);
+            assert_eq!(outcome.after.as_bytes().as_slice(), after.as_slice());
+            assert_eq!(
+                outcome.after.button(layer, g(number)),
+                text.parse::<ButtonAssignment>().expect("valid text")
+            );
+            assert!(
+                differing(&before, &after)
+                    .iter()
+                    .all(|i| (offset..offset + 3).contains(i)),
+                "{slot:?} {layer:?} G{number} changed bytes outside its own entry"
+            );
+            for other in ProfileSlot::ALL.into_iter().filter(|other| *other != slot) {
+                let untouched = match other {
+                    ProfileSlot::First => bytes(FIRST),
+                    ProfileSlot::Second => bytes(SECOND),
+                    ProfileSlot::Third => bytes(THIRD),
+                };
+                assert_eq!(backend.stored(other.report_id()), untouched);
+            }
+            assert_eq!(backend.writes_seen(), vec![after]);
+        }
+    }
+
+    #[test]
+    fn an_unrecognized_entry_survives_an_edit_of_its_neighbour() {
+        let backend = FakeBackend::with_g600();
+        run_edit(
+            &backend,
+            edit(ProfileSlot::Third, Layer::Normal, 15, "key:f13"),
+            PrimaryButtons::Protect,
+        )
+        .expect("the edit is kept");
+        let third = Profile::parse(&backend.stored(0xf5)).expect("a profile");
+        assert_eq!(
+            third.button(Layer::Normal, g(16)),
+            ButtonAssignment::Unrecognized {
+                code: 0x16,
+                modifiers: 0,
+                usage: 0
+            }
+        );
+    }
+
+    #[test]
+    fn setting_what_is_already_set_writes_nothing() {
+        let backend = FakeBackend::with_g600();
+        let outcome = run_edit(
+            &backend,
+            edit(ProfileSlot::First, Layer::Normal, 8, "fn:profile-cycle"),
+            PrimaryButtons::Protect,
+        )
+        .expect("a no-op edit succeeds");
+        assert!(!outcome.written);
+        assert_eq!(outcome.before, outcome.after);
+        assert!(backend.writes_seen().is_empty());
+    }
+
+    #[test]
+    fn the_primary_clicks_are_protected_unless_allowed() {
+        for number in [1, 2] {
+            let backend = FakeBackend::with_g600();
+            let error = run_edit(
+                &backend,
+                edit(ProfileSlot::First, Layer::Normal, number, "key:a"),
+                PrimaryButtons::Protect,
+            )
+            .expect_err("a primary click is protected");
+            assert!(
+                matches!(error, EditError::PrimaryButton { button } if button == g(number)),
+                "{error}"
+            );
+            assert!(backend.writes_seen().is_empty(), "nothing may be written");
+
+            run_edit(
+                &backend,
+                edit(ProfileSlot::First, Layer::Normal, number, "key:a"),
+                PrimaryButtons::Allow,
+            )
+            .expect("allowed on request");
+            assert_eq!(backend.writes_seen().len(), 1);
+        }
+    }
+
+    #[test]
+    fn protection_covers_only_the_normal_layers_two_clicks() {
+        let backend = FakeBackend::with_g600();
+        for (layer, number) in [(Layer::Shifted, 1), (Layer::Normal, 3), (Layer::Normal, 20)] {
+            run_edit(
+                &backend,
+                edit(ProfileSlot::First, layer, number, "key:a"),
+                PrimaryButtons::Protect,
+            )
+            .expect("not a primary click");
+        }
+        // Keeping a primary click as it is is not changing it.
+        run_edit(
+            &backend,
+            edit(ProfileSlot::First, Layer::Normal, 1, "mouse:1"),
+            PrimaryButtons::Protect,
+        )
+        .expect("unchanged");
+    }
+
+    #[test]
+    fn a_mouse_that_does_not_keep_the_write_is_reported_with_the_original() {
+        let backend = FakeBackend::with_g600().with_writes(Writes::Ignore);
+        let error = run_edit(
+            &backend,
+            edit(ProfileSlot::First, Layer::Normal, 9, "key:b"),
+            PrimaryButtons::Protect,
+        )
+        .expect_err("the read-back differs");
+        let EditError::NotKept { before, read_back } = error else {
+            panic!("expected NotKept, got {error}");
+        };
+        assert_eq!(before.as_bytes().as_slice(), bytes(FIRST).as_slice());
+        assert_eq!(read_back.as_bytes().as_slice(), bytes(FIRST).as_slice());
+    }
+
+    #[test]
+    fn a_failed_write_is_an_error_not_a_silent_success() {
+        let backend = FakeBackend::with_g600().with_writes(Writes::Fail);
+        let error = run_edit(
+            &backend,
+            edit(ProfileSlot::First, Layer::Normal, 9, "key:b"),
+            PrimaryButtons::Protect,
+        )
+        .expect_err("the write fails");
+        assert!(matches!(error, EditError::Write(_)), "{error}");
+    }
+
+    #[test]
+    fn an_edit_refuses_a_route_that_is_not_a_g600_and_writes_nothing() {
+        let backend = FakeBackend::with_g600();
+        let error = futures_lite::future::block_on(edit_button(
+            &backend,
+            &raw_route(0xc900, 0xff43, 0x0202, "id:g600-node"),
+            edit(ProfileSlot::First, Layer::Normal, 9, "key:b"),
+            PrimaryButtons::Protect,
+        ))
+        .expect_err("not a G600");
+        assert!(matches!(error, EditError::Read(ReadError::NotAG600)));
+        assert!(backend.writes_seen().is_empty());
+    }
+
+    #[test]
+    fn re_setting_every_entry_to_what_it_decodes_as_is_lossless() {
+        for report in [FIRST, SECOND, THIRD] {
+            let profile = profile(report);
+            for layer in [Layer::Normal, Layer::Shifted] {
+                for button in GButton::all() {
+                    assert_eq!(
+                        profile.with_button(layer, button, profile.button(layer, button)),
+                        profile,
+                        "{layer:?} G{}",
+                        button.number()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_entry_encodes_back_to_the_bytes_it_decoded_from() {
+        for code in 0..=255_u8 {
+            for modifiers in [0x00, 0x01, 0x82] {
+                for usage in [0x00, 0x05, 0xff] {
+                    let entry = [code, modifiers, usage];
+                    assert_eq!(ButtonAssignment::decode(entry).encode(), entry);
+                }
+            }
+        }
     }
 
     #[test]
