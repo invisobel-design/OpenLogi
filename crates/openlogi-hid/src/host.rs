@@ -23,7 +23,10 @@ use openlogi_device::ChannelPool;
 use openlogi_device::LightWatch;
 use openlogi_device::backend::{HidBackend, HotplugStream};
 use openlogi_device::backlight::{BacklightChange, BacklightState};
-use openlogi_device::g600::{ReadError as G600ReadError, Snapshot as G600Snapshot};
+use openlogi_device::g600::{
+    ButtonEdit, EditError as G600EditError, EditOutcome as G600EditOutcome, PrimaryButtons,
+    ReadError as G600ReadError, Snapshot as G600Snapshot,
+};
 use openlogi_device::inventory::{Enumerator, InventoryError};
 use openlogi_device::pairing::PairingReceiver;
 use openlogi_device::write::{
@@ -244,6 +247,16 @@ pub async fn watch_litra(
 /// reaches. Read-only: nothing is written to the mouse.
 pub async fn read_g600_snapshot(route: &DeviceRoute) -> Result<G600Snapshot, G600ReadError> {
     openlogi_device::g600::read_snapshot(&*native_backend(), route).await
+}
+
+/// Set one button of one onboard profile of the G600 `route` reaches, then
+/// read the profile back to confirm the mouse kept it.
+pub async fn edit_g600_button(
+    route: &DeviceRoute,
+    edit: ButtonEdit,
+    guard: PrimaryButtons,
+) -> Result<G600EditOutcome, G600EditError> {
+    openlogi_device::g600::edit_button(&*native_backend(), route, edit, guard).await
 }
 
 /// Walk the HID++ feature table of the device `route` reaches.
