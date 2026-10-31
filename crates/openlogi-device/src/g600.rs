@@ -646,6 +646,46 @@ pub enum EditError {
     },
 }
 
+/// Write one raw profile report to the G600 `route` addresses, with no checks
+/// on its contents beyond which report it is. Nothing is read back.
+///
+/// A diagnostic for finding out how the mouse stores what it is sent. The
+/// report may be any length, so a caller can test what the mouse does with a
+/// shorter or longer one; [`edit_button`] is the checked way to change a
+/// button.
+///
+/// # Errors
+///
+/// [`ReadError::NotAG600`] when `route` is not a G600; [`ProfileError`] when
+/// the report is empty or its first byte is not a profile report ID, so no
+/// other report can be written by mistake; the route errors of
+/// [`read_snapshot`]; and [`EditError::Write`] when the write fails.
+pub async fn write_profile_report(
+    backend: &dyn HidBackend,
+    route: &DeviceRoute,
+    report: &[u8],
+) -> Result<(), EditError> {
+    if !is_g600_route(route) {
+        return Err(ReadError::NotAG600.into());
+    }
+    let id = *report
+        .first()
+        .ok_or(ReadError::Profile(ProfileError::WrongLength { actual: 0 }))?;
+    ProfileSlot::from_report_id(id).ok_or(ReadError::Profile(ProfileError::NotAProfile(id)))?;
+    let node = find_raw_route_node(backend, route)
+        .await
+        .map_err(ReadError::from)?
+        .ok_or(ReadError::DeviceNotFound)?;
+    let mut writer = backend
+        .open_feature_writer(&node)
+        .await
+        .map_err(EditError::Write)?;
+    writer
+        .write_feature_report(report)
+        .await
+        .map_err(EditError::Write)
+}
+
 /// Whether `edit` would change what a primary click (G1 or G2, normal layer) does.
 fn touches_primary(edit: ButtonEdit, current: &Profile) -> bool {
     edit.layer == Layer::Normal
@@ -1518,6 +1558,64 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_raw_write_sends_exactly_the_bytes_given_whatever_their_length() {
+        for len in [153, 154, 155] {
+            let backend = FakeBackend::with_g600();
+            let mut report = bytes(FIRST);
+            report.resize(len, 0);
+            futures_lite::future::block_on(write_profile_report(&backend, &g600_route(), &report))
+                .expect("a profile report is written");
+            assert_eq!(backend.writes_seen(), vec![report]);
+        }
+    }
+
+    #[test]
+    fn a_raw_write_refuses_anything_that_is_not_a_profile_report() {
+        for report in [
+            vec![],
+            bytes(ACTIVE),
+            vec![0x00; 154],
+            vec![0xf2, 1, 2],
+            vec![0xf6],
+        ] {
+            let backend = FakeBackend::with_g600();
+            let error = futures_lite::future::block_on(write_profile_report(
+                &backend,
+                &g600_route(),
+                &report,
+            ))
+            .expect_err("only profile reports may be written");
+            assert!(
+                matches!(error, EditError::Read(ReadError::Profile(_))),
+                "{error}"
+            );
+            assert!(backend.writes_seen().is_empty());
+        }
+    }
+
+    #[test]
+    fn a_raw_write_refuses_a_route_that_is_not_a_g600_and_reports_a_failed_write() {
+        let backend = FakeBackend::with_g600();
+        let error = futures_lite::future::block_on(write_profile_report(
+            &backend,
+            &raw_route(0xc900, 0xff43, 0x0202, "id:g600-node"),
+            &bytes(FIRST),
+        ))
+        .expect_err("not a G600");
+        assert!(matches!(error, EditError::Read(ReadError::NotAG600)));
+        assert!(backend.writes_seen().is_empty());
+
+        let failing = FakeBackend::with_g600().with_writes(Writes::Fail);
+        let error = futures_lite::future::block_on(write_profile_report(
+            &failing,
+            &g600_route(),
+            &bytes(FIRST),
+        ))
+        .expect_err("the write fails");
+        assert!(matches!(error, EditError::Write(_)));
     }
 
     #[test]

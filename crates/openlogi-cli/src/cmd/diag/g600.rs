@@ -20,7 +20,44 @@ pub enum G600Cmd {
     /// Print the three onboard profiles. Reads only; nothing is written.
     Show(ShowArgs),
     /// Change one button of one onboard profile, then read it back to confirm.
+    ///
+    /// Disabled: on a real G600 this wrote a shifted copy of the old profile
+    /// instead of the change. Use `write-raw` to study that.
     Set(SetArgs),
+    /// Write exact bytes to one onboard profile and watch how the mouse stores
+    /// them. A diagnostic; it can leave the profile scrambled.
+    WriteRaw(WriteRawArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct WriteRawArgs {
+    /// Which onboard profile to write, 1 to 3. Must match the report ID of the
+    /// bytes.
+    #[arg(long, value_parser = clap::value_parser!(u8).range(1..=3))]
+    pub profile: u8,
+
+    /// The whole report as hexadecimal bytes separated by spaces, report ID
+    /// first (`f3 00 00 ...`). Exactly what `show --raw` prints after `raw:`.
+    #[arg(long, value_parser = parse_hex)]
+    pub hex: HexBytes,
+
+    /// Send this many bytes: the report is cut, or padded with zeros, to this
+    /// length. The default sends it whole.
+    #[arg(long)]
+    pub send_len: Option<usize>,
+}
+
+/// Bytes given as hexadecimal text. A type of its own so clap reads the whole
+/// argument as one value instead of one byte per occurrence.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HexBytes(pub Vec<u8>);
+
+/// Parse space-separated hexadecimal bytes.
+fn parse_hex(text: &str) -> Result<HexBytes, String> {
+    text.split_whitespace()
+        .map(|byte| u8::from_str_radix(byte, 16).map_err(|_| format!("`{byte}` is not a hex byte")))
+        .collect::<Result<_, _>>()
+        .map(HexBytes)
 }
 
 #[derive(Debug, Args)]
@@ -63,9 +100,13 @@ impl G600Cmd {
         match self {
             Self::Show(args) => show(&args).await,
             Self::Set(args) => set(&args).await,
+            Self::WriteRaw(args) => write_raw(&args).await,
         }
     }
 }
+
+/// Whether `set` may run. See [`set`].
+const ENABLE_SET: bool = false;
 
 /// The route of the one connected G600.
 async fn route() -> Result<DeviceRoute> {
@@ -94,6 +135,14 @@ async fn show(args: &ShowArgs) -> Result<()> {
 }
 
 async fn set(args: &SetArgs) -> Result<()> {
+    // Disabled after it scrambled a real profile; kept so the arguments and
+    // the checked write path stay in place for when writes are understood.
+    if !ENABLE_SET {
+        return Err(anyhow!(
+            "`set` is disabled: on a real G600 the mouse stored a shifted copy of the \
+             old profile instead of the change. Run `diag g600 write-raw` to study it."
+        ));
+    }
     let slot = ProfileSlot::ALL[usize::from(args.profile - 1)];
     let button = GButton::new(args.button).ok_or_else(|| anyhow!("no such button"))?;
     let layer = if args.shifted {
@@ -127,6 +176,79 @@ async fn set(args: &SetArgs) -> Result<()> {
         println!("already set; nothing was written.");
     }
     Ok(())
+}
+
+/// How long after a write to read the profile back, in seconds.
+const READ_BACK_AFTER: [u64; 3] = [0, 1, 3];
+
+async fn write_raw(args: &WriteRawArgs) -> Result<()> {
+    let wanted = Profile::parse(&args.hex.0).context("--hex is not a whole profile report")?;
+    let slot = ProfileSlot::ALL[usize::from(args.profile - 1)];
+    if wanted.slot() != slot {
+        return Err(anyhow!(
+            "--profile {} does not match the report ID {:#04x} in --hex",
+            args.profile,
+            wanted.as_bytes()[0]
+        ));
+    }
+    let mut report = wanted.as_bytes().to_vec();
+    if let Some(len) = args.send_len {
+        report.resize(len, 0);
+    }
+    let route = route().await?;
+    println!("writing {} bytes to profile {}", report.len(), args.profile);
+    openlogi_hid::write_g600_profile_report(&route, &report)
+        .await
+        .context("the write failed")?;
+    let mut elapsed = 0;
+    for after in READ_BACK_AFTER {
+        tokio::time::sleep(std::time::Duration::from_secs(after - elapsed)).await;
+        elapsed = after;
+        let snapshot = openlogi_hid::read_g600_snapshot(&route)
+            .await
+            .context("failed to read the G600 back")?;
+        let stored = &snapshot.profiles[usize::from(args.profile - 1)];
+        println!(
+            "after {after}s: {}",
+            compare(wanted.as_bytes(), stored.as_bytes())
+        );
+        if stored != &wanted {
+            println!("  stored: {}", hex(stored.as_bytes()));
+        }
+    }
+    Ok(())
+}
+
+/// How a stored report relates to the one that was written.
+fn compare(written: &[u8], stored: &[u8]) -> String {
+    if written == stored {
+        return "identical to what was written".to_owned();
+    }
+    let differing = written
+        .iter()
+        .zip(stored)
+        .filter(|(written, stored)| written != stored)
+        .count();
+    match shift_between(written, stored) {
+        Some(shift) => format!(
+            "differs in {differing} bytes; the stored bytes look like what was written moved {shift:+} position(s)"
+        ),
+        None => format!("differs in {differing} bytes, and not by a simple shift"),
+    }
+}
+
+/// The shift that turns `written` into `stored`, if one does: the stored byte
+/// at `i` is the written byte at `i - shift` across the middle of the report,
+/// where the ends cannot confuse it.
+fn shift_between(written: &[u8], stored: &[u8]) -> Option<isize> {
+    let (start, end) = (8_usize, written.len().min(stored.len()).checked_sub(8)?);
+    (-4..=4_isize).filter(|shift| *shift != 0).find(|&shift| {
+        (start..end).all(|i| {
+            i.checked_add_signed(-shift)
+                .and_then(|from| written.get(from))
+                .is_some_and(|byte| *byte == stored[i])
+        })
+    })
 }
 
 /// An edit error, with what to do about the ones that need action.
@@ -209,7 +331,7 @@ fn hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{G600Cmd, dpi_text, hex};
+    use super::{G600Cmd, compare, dpi_text, hex, parse_hex, shift_between};
     use crate::cmd::diag::DiagCmd;
     use clap::Parser;
     use openlogi_hid::g600::ButtonAssignment;
@@ -275,6 +397,62 @@ mod tests {
         ] {
             parse(args).expect_err("must be refused before touching a device");
         }
+    }
+
+    #[test]
+    fn set_is_disabled_until_writes_are_understood() {
+        let G600Cmd::Set(args) = parse(&[
+            "set",
+            "--profile",
+            "2",
+            "--button",
+            "7",
+            "--assign",
+            "key:b",
+        ])
+        .expect("valid") else {
+            panic!("expected set");
+        };
+        let error = futures::executor::block_on(super::set(&args))
+            .expect_err("set must refuse before touching a device");
+        assert!(error.to_string().contains("disabled"), "{error}");
+    }
+
+    #[test]
+    fn write_raw_takes_hex_bytes_and_refuses_bad_ones() {
+        let G600Cmd::WriteRaw(args) = parse(&[
+            "write-raw",
+            "--profile",
+            "1",
+            "--hex",
+            "f3 00 ff",
+            "--send-len",
+            "153",
+        ])
+        .expect("valid") else {
+            panic!("expected write-raw");
+        };
+        assert_eq!(args.hex.0, [0xf3, 0x00, 0xff]);
+        assert_eq!(args.send_len, Some(153));
+        assert_eq!(parse_hex("zz"), Err("`zz` is not a hex byte".to_owned()));
+        assert_eq!(parse_hex("f3 0a"), Ok(super::HexBytes(vec![0xf3, 0x0a])));
+        parse(&["write-raw", "--profile", "1", "--hex", "f3 xx"])
+            .expect_err("a bad byte is refused before any device is touched");
+    }
+
+    #[test]
+    fn a_shifted_copy_is_recognised_and_other_differences_are_not() {
+        let written: Vec<u8> = (0..154).map(|i| (i * 7 % 251) as u8).collect();
+        let mut shifted = vec![0, 0];
+        shifted.extend_from_slice(&written[1..153]);
+        assert_eq!(shift_between(&written, &shifted), Some(1));
+        assert!(compare(&written, &shifted).contains("+1"));
+        assert_eq!(compare(&written, &written), "identical to what was written");
+
+        let mut edited = written.clone();
+        edited[60] ^= 0xff;
+        assert!(compare(&written, &edited).contains("not by a simple shift"));
+        assert_eq!(shift_between(&written, &[]), None);
     }
 
     #[test]

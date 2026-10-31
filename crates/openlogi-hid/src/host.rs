@@ -259,6 +259,15 @@ pub async fn edit_g600_button(
     openlogi_device::g600::edit_button(&*native_backend(), route, edit, guard).await
 }
 
+/// Write one raw profile report to the G600 `route` reaches. A diagnostic:
+/// nothing is read back and the contents are not checked.
+pub async fn write_g600_profile_report(
+    route: &DeviceRoute,
+    report: &[u8],
+) -> Result<(), G600EditError> {
+    openlogi_device::g600::write_profile_report(&*native_backend(), route, report).await
+}
+
 /// Walk the HID++ feature table of the device `route` reaches.
 pub async fn dump_features(route: &DeviceRoute) -> Result<Vec<FeatureEntry>, WriteError> {
     device::dump_features(&*native_backend(), route).await
